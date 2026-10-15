@@ -17,6 +17,26 @@ if sys.platform == 'win32':
 # Create an MCP server
 mcp = FastMCP("VnExpress")
 
+# Danh mục RSS chính thức của VnExpress
+RSS_FEEDS = {
+    "home": "https://vnexpress.net/rss/tin-moi-nhat.rss",
+    "thoi-su": "https://vnexpress.net/rss/thoi-su.rss",
+    "the-gioi": "https://vnexpress.net/rss/the-gioi.rss",
+    "kinh-doanh": "https://vnexpress.net/rss/kinh-doanh.rss",
+    "bat-dong-san": "https://vnexpress.net/rss/bat-dong-san.rss",
+    "khoa-hoc": "https://vnexpress.net/rss/khoa-hoc.rss",
+    "giai-tri": "https://vnexpress.net/rss/giai-tri.rss",
+    "the-thao": "https://vnexpress.net/rss/the-thao.rss",
+    "phap-luat": "https://vnexpress.net/rss/phap-luat.rss",
+    "giao-duc": "https://vnexpress.net/rss/giao-duc.rss",
+    "suc-khoe": "https://vnexpress.net/rss/suc-khoe.rss",
+    "doi-song": "https://vnexpress.net/rss/doi-song.rss",
+    "du-lich": "https://vnexpress.net/rss/du-lich.rss",
+    "so-hoa": "https://vnexpress.net/rss/so-hoa.rss",
+    "xe": "https://vnexpress.net/rss/oto-xe-may.rss",
+    "goc-nhin": "https://vnexpress.net/rss/y-kien.rss",
+}
+
 @mcp.tool()
 def get_vnexpress_news(category: str = "home", limit: int = 10) -> dict:
     """
@@ -41,24 +61,63 @@ def get_vnexpress_news(category: str = "home", limit: int = 10) -> dict:
     - xe: Xe
     """
     try:
-        # Xây dựng URL dựa trên category
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
+        }
+
+        # Ưu tiên lấy tin qua RSS Feed (cực kỳ nhanh, ổn định và đầy đủ tóm tắt)
+        rss_url = RSS_FEEDS.get(category.lower().strip())
+        if rss_url:
+            try:
+                logger.info(f"Fetching RSS feed: {rss_url}")
+                rss_resp = requests.get(rss_url, headers=headers, timeout=10)
+                if rss_resp.status_code == 200:
+                    rss_soup = BeautifulSoup(rss_resp.content, "xml")
+                    items = rss_soup.find_all("item")
+                    if items:
+                        articles = []
+                        for it in items[:limit]:
+                            t_elem = it.find("title")
+                            l_elem = it.find("link")
+                            d_elem = it.find("description")
+                            p_elem = it.find("pubDate")
+                            
+                            title = t_elem.get_text(strip=True) if t_elem else ""
+                            link = l_elem.get_text(strip=True) if l_elem else ""
+                            raw_desc = d_elem.get_text(strip=True) if d_elem else ""
+                            clean_desc = re.sub(r'<[^>]+>', '', raw_desc).strip()
+                            pub_date = p_elem.get_text(strip=True) if p_elem else ""
+                            
+                            if title and link:
+                                articles.append({
+                                    "title": title,
+                                    "url": link,
+                                    "description": clean_desc,
+                                    "time": pub_date,
+                                    "category": category
+                                })
+                        if articles:
+                            logger.info(f"Successfully fetched {len(articles)} articles from RSS")
+                            return {
+                                "success": True,
+                                "category": category,
+                                "total_articles": len(articles),
+                                "articles": articles,
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "source": "VnExpress.net (RSS)"
+                            }
+            except Exception as e:
+                logger.warning(f"Lỗi khi đọc RSS, chuyển sang HTML scraping: {e}")
+
+        # Fallback: HTML Scraping
         if category == "home":
             url = "https://vnexpress.net/"
         else:
             url = f"https://vnexpress.net/{category}"
         
-        logger.info(f"Fetching news from: {url}")
-        
-        # Headers để giả lập browser
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-        }
-        
+        logger.info(f"Fetching news from HTML: {url}")
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         response.encoding = 'utf-8'

@@ -9,6 +9,16 @@
       "command": "python",
       "args": ["VnExpress.py"],
       "type": "stdio"
+    },
+    "GoldPrice": {
+      "command": "python",
+      "args": ["gold_price.py"],
+      "type": "stdio"
+    },
+    "VietnamServices": {
+      "command": "python",
+      "args": ["vietnam_services.py"],
+      "type": "stdio"
     }
   }
 }

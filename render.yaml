@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: xiaozhi-music-server
+    runtime: docker
+    plan: free
+    region: singapore
+    envVars:
+      - key: PORT
+        value: 10000
+    healthCheckPath: /health
