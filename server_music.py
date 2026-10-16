@@ -206,8 +206,21 @@ class ZingMP3Engine:
             print(f"[!] Lỗi lấy stream ZingMP3 {song_id}: {e}")
             return None
 
+    async def get_song_title(self, song_id: str):
+        """Lấy tên bài hát từ ZingMP3 để hỗ trợ Fallback"""
+        try:
+            await self.ensure_initialized()
+            clean_id = song_id[5:] if song_id.startswith("zing_") else song_id
+            url = self.build_api_url("init", {"id": clean_id})
+            resp = await self.session.get(url)
+            data = resp.json().get("data", {})
+            return data.get("title")
+        except Exception:
+            return None
+
 
 zing_engine = ZingMP3Engine()
+
 
 
 # =====================================================================
@@ -235,6 +248,8 @@ def get_ydl_opts_yt_stream():
             "node": {"path": node_path}
         },
         "remote_components": ["ejs:github"],
+        "socket_timeout": 6,
+        "retries": 1,
     }
 
 
@@ -566,13 +581,63 @@ def index_page():
     """
 
 
+# Bộ nhớ đệm lưu tiêu đề bài hát từ các lượt tìm kiếm để phục vụ tự động Fallback
+SONG_TITLE_CACHE: dict[str, str] = {}
+
+
 @app.get("/health")
-def health_check():
+async def health_check():
+    pot_active = False
+    try:
+        async with httpx.AsyncClient(timeout=1.0) as check_client:
+            resp = await check_client.get("http://127.0.0.1:4416/ping")
+            if resp.status_code == 200:
+                pot_active = True
+    except Exception:
+        pass
+
     return {
         "status": "ok",
         "engines": ["ZingMP3", "YouTube", "SoundCloud"],
-        "botguard_pot": "active",
+        "botguard_pot": "active" if pot_active else "offline",
         "compatible_with": "Xiaozhi ESP32",
+    }
+
+
+@app.get("/api/debug")
+async def debug_endpoint():
+    node_path = get_node_path()
+    node_ver = "not found"
+    if node_path:
+        try:
+            res = subprocess.run([node_path, "-v"], capture_output=True, text=True, timeout=2)
+            node_ver = res.stdout.strip()
+        except Exception as e:
+            node_ver = f"error: {e}"
+
+    pot_status = "offline"
+    try:
+        async with httpx.AsyncClient(timeout=1.5) as c:
+            r = await c.get("http://127.0.0.1:4416/ping")
+            pot_status = r.json()
+    except Exception as e:
+        pot_status = f"offline ({e})"
+
+    bgutil_paths = [
+        os.path.expanduser("~/bgutil-ytdlp-pot-provider/server/build/main.js"),
+        "/app/bgutil-server/server/build/main.js",
+        os.path.join(os.getcwd(), "bgutil-server/server/build/main.js"),
+    ]
+    found_bgutil = [p for p in bgutil_paths if os.path.exists(p)]
+
+    return {
+        "status": "debug",
+        "is_docker": os.path.exists("/app/entrypoint.sh"),
+        "node_path": node_path,
+        "node_version": node_ver,
+        "botguard_pot_provider": pot_status,
+        "found_bgutil_scripts": found_bgutil,
+        "cached_songs_count": len(SONG_TITLE_CACHE),
     }
 
 
@@ -585,7 +650,7 @@ async def search_song(q: str):
         # Chạy tìm kiếm song song không block event loop
         zing_task = zing_engine.search(q, limit=4)
         yt_task = asyncio.to_thread(search_youtube, q, 4)
-        sc_task = asyncio.to_thread(search_soundcloud, q, 2)
+        sc_task = asyncio.to_thread(search_soundcloud, q, 3)
 
         zing_results, yt_results, sc_results = await asyncio.gather(
             zing_task, yt_task, sc_task, return_exceptions=True
@@ -597,6 +662,11 @@ async def search_song(q: str):
 
         # Kết hợp kết quả: Ưu tiên ZingMP3 -> YouTube -> SoundCloud
         combined = zing_items + yt_items + sc_items
+
+        # Lưu tiêu đề bài hát vào cache để hỗ trợ tự động Fallback cứu luồng âm thanh
+        for item in combined:
+            if item.get("encodeId") and item.get("title"):
+                SONG_TITLE_CACHE[item["encodeId"]] = item["title"]
 
         return {
             "err": 0,
@@ -612,9 +682,9 @@ async def stream_song(id: str, request: Request):
     """
     Stream âm thanh trực tiếp về ESP32 hoặc Web Browser.
     Hỗ trợ phát từ ZingMP3 (MP3 128kbps), YouTube (M4A/AAC có PO-Token) và SoundCloud (fMP4/AAC).
-    Tự động Fallback đa tầng: ZingMP3 (nếu VIP) -> YouTube -> SoundCloud.
+    Tự động Fallback đa tầng bảo đảm ESP32 không bao giờ bị đứt kết nối: ZingMP3 -> YouTube -> SoundCloud.
     """
-    fallback_title = request.query_params.get("title")
+    fallback_title = request.query_params.get("title") or SONG_TITLE_CACHE.get(id)
 
     try:
         # ==============================================================
@@ -625,11 +695,24 @@ async def stream_song(id: str, request: Request):
                 return await stream_youtube_track(id, request)
             except Exception as e:
                 print(f"[!] Lỗi stream YouTube {id}: {e}")
+
+                # Nếu chưa có fallback_title, bóc tách nhanh tiêu đề từ YouTube metadata
+                if not fallback_title:
+                    clean_vid = id[3:]
+                    try:
+                        def _get_yt_title():
+                            with yt_dlp.YoutubeDL({'quiet': True, 'skip_download': True, 'extract_flat': True}) as ydl:
+                                return ydl.extract_info(f"https://www.youtube.com/watch?v={clean_vid}", download=False).get("title")
+                        fallback_title = await asyncio.to_thread(_get_yt_title)
+                    except Exception:
+                        pass
+
                 if fallback_title:
-                    print(f"[+] Fallback YouTube sang SoundCloud cho: {fallback_title}")
+                    print(f"[+] Fallback YouTube sang SoundCloud cho bài: {fallback_title}")
                     sc_candidates = await asyncio.to_thread(search_soundcloud, fallback_title, 1)
                     if sc_candidates:
                         return await stream_soundcloud_track(sc_candidates[0]["encodeId"], request)
+
                 raise HTTPException(status_code=500, detail=f"Lỗi phát nhạc YouTube: {e}")
 
         # ==============================================================
@@ -670,24 +753,26 @@ async def stream_song(id: str, request: Request):
                     headers=response_headers,
                 )
 
-            # Nếu Zing VIP -> Fallback sang YouTube trước, sau đó SoundCloud
+            # Nếu Zing VIP hoặc bị chặn IP nước ngoài trên Render -> Tìm title để Fallback
+            if not fallback_title:
+                fallback_title = await zing_engine.get_song_title(id)
+
             if fallback_title:
-                print(f"[+] Bài Zing {id} là VIP, tự động fallback sang YouTube: {fallback_title}")
+                print(f"[+] Bài Zing {id} không phát trực tiếp được, tự động fallback sang YouTube: {fallback_title}")
                 yt_candidates = await asyncio.to_thread(search_youtube, fallback_title, 1)
                 if yt_candidates:
                     try:
                         return await stream_youtube_track(yt_candidates[0]["encodeId"], request)
                     except Exception as yt_err:
-                        print(f"[!] Fallback YouTube thất bại: {yt_err}")
+                        print(f"[!] Fallback YouTube thất bại ({yt_err}), chuyển tiếp sang SoundCloud: {fallback_title}")
 
-                print(f"[+] Chuyển tiếp fallback sang SoundCloud: {fallback_title}")
                 sc_candidates = await asyncio.to_thread(search_soundcloud, fallback_title, 1)
                 if sc_candidates:
                     return await stream_soundcloud_track(sc_candidates[0]["encodeId"], request)
 
             raise HTTPException(
                 status_code=403,
-                detail="Bài hát này yêu cầu Zing VIP và không tìm thấy bản thay thế miễn phí trên YouTube / SoundCloud."
+                detail="Bài hát này không phát được trên Zing và không tìm thấy bản thay thế trên SoundCloud."
             )
 
         # ==============================================================
