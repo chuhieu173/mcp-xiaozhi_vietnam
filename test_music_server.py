@@ -26,61 +26,45 @@ def test_server(server_url: str, song_name: str = "lạc trôi"):
         print(f"   [!] Lỗi kết nối: {e}")
         return
 
-    # 2. Tìm kiếm bài hát
-    print(f"\n2. Tìm kiếm bài hát: '{song_name}'...")
-    search_url = f"{server_url}/api/search"
+    # 2. Kiểm tra API chuẩn của ESP32: /stream_pcm
+    print(f"\n2. Kiểm tra API ESP32 (/stream_pcm?song={song_name})...")
+    pcm_url = f"{server_url}/stream_pcm"
+    audio_url = ""
     try:
-        r_search = requests.get(search_url, params={"q": song_name}, timeout=20)
-        if r_search.status_code != 200:
-            print(f"   [!] API search lỗi: HTTP {r_search.status_code} - {r_search.text}")
-            return
-
-        data = r_search.json()
-        items = data.get("data", {}).get("items", [])
-        if not items:
-            print("   [!] Không tìm thấy bài hát nào.")
-            return
-
-        print(f"   [+] Tìm thấy {len(items)} bài hát:")
-        for idx, item in enumerate(items, 1):
-            print(f"       [{idx}] {item.get('title')} - ID: {item.get('encodeId')}")
-
-        # Chọn bài đầu tiên để test phát nhạc
-        first_song = items[0]
-        song_id = first_song.get("encodeId")
-        song_title = first_song.get("title")
-
-    except Exception as e:
-        print(f"   [!] Lỗi khi gọi API search: {e}")
-        return
-
-    # 3. Lấy link stream và nghe thử
-    print(f"\n3. Kiểm tra link phát nhạc (Stream) cho bài: '{song_title}'...")
-    stream_url = f"{server_url}/api/song/stream?id={song_id}"
-    print(f"   URL stream: {stream_url}")
-
-    try:
-        # Không theo redirect tự động để kiểm tra mã 302
-        r_stream = requests.get(stream_url, allow_redirects=False, timeout=20)
-        print(f"   [+] Mã HTTP trả về: {r_stream.status_code}")
-        
-        if r_stream.status_code in [301, 302, 307, 308]:
-            redirect_url = r_stream.headers.get("Location")
-            print(f"   [+] Đã chuyển hướng 302 thành công tới luồng Audio của YouTube!")
-            print(f"   -> Link âm thanh: {redirect_url[:100]}...")
-            
-            # Mở trình duyệt để nghe trực tiếp trên máy Mac
-            print("\n4. Đang mở trình duyệt để phát nhạc trực tiếp ra loa máy tính...")
-            webbrowser.open(stream_url)
-            print("   [✓] Hãy kiểm tra tab trình duyệt vừa mở để nghe nhạc!")
-        elif r_stream.status_code == 200:
-            print("   [+] Server trả về luồng âm thanh trực tiếp (200 OK)!")
-            webbrowser.open(stream_url)
+        r_pcm = requests.get(pcm_url, params={"song": song_name}, timeout=20)
+        print(f"   [+] Phản hồi: HTTP {r_pcm.status_code}")
+        if r_pcm.status_code == 200:
+            pcm_data = r_pcm.json()
+            print(f"   [+] JSON trả về: {json.dumps(pcm_data, ensure_ascii=False, indent=2)}")
+            audio_url = pcm_data.get("audio_url")
+            lyric_url = pcm_data.get("lyric_url")
+            print(f"   -> Tên bài: {pcm_data.get('title')} ({pcm_data.get('artist')})")
+            print(f"   -> Audio URL: {audio_url}")
+            print(f"   -> Lyric URL: {lyric_url}")
         else:
-            print(f"   [!] Không lấy được luồng âm thanh: {r_stream.status_code} - {r_stream.text}")
-
+            print(f"   [!] API /stream_pcm lỗi: HTTP {r_pcm.status_code} - {r_pcm.text}")
     except Exception as e:
-        print(f"   [!] Lỗi khi test stream: {e}")
+        print(f"   [!] Lỗi khi gọi /stream_pcm: {e}")
+
+    # 3. Kiểm tra luồng Audio Stream (MP3 định dạng bắt buộc cho ESP32)
+    if audio_url:
+        print(f"\n3. Kiểm tra Audio Stream từ audio_url...")
+        try:
+            r_audio = requests.get(audio_url, stream=True, timeout=25)
+            print(f"   [+] Mã HTTP: {r_audio.status_code}")
+            content_type = r_audio.headers.get("content-type", "")
+            print(f"   [+] Content-Type: {content_type}")
+            
+            # Đọc 128 byte đầu tiên để kiểm tra Magic Byte MP3
+            first_chunk = next(r_audio.iter_content(chunk_size=128), b"")
+            is_mp3 = first_chunk.startswith(b"ID3") or (len(first_chunk) >= 2 and first_chunk[0] == 0xFF and (first_chunk[1] & 0xE0) == 0xE0)
+            print(f"   [+] Chuẩn MP3 (libhelix-mp3 ESP32): {'ĐẠT CHUẨN (ID3/MPEG Frame)' if is_mp3 else 'Khác: ' + str(first_chunk[:10])}")
+
+            print("\n4. Đang mở trình duyệt để phát thử nhạc...")
+            webbrowser.open(audio_url)
+            print("   [✓] Đã gửi URL phát nhạc sang trình duyệt!")
+        except Exception as e:
+            print(f"   [!] Lỗi kiểm tra Audio Stream: {e}")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:

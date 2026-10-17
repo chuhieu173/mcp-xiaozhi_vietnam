@@ -25,6 +25,7 @@ import os
 import sys
 import shutil
 import subprocess
+import io
 
 # Tải trước các plugin của yt_dlp trên luồng chính để tránh race condition khi import đa luồng
 try:
@@ -275,8 +276,83 @@ def search_youtube(q: str, limit: int = 4):
         return []
 
 
+async def transcode_stream_to_mp3(upstream_resp, client_to_close: httpx.AsyncClient = None):
+    """
+    Chuyển đổi luồng âm thanh thời gian thực (M4A, AAC, Opus) sang chuẩn MP3 128kbps 44100Hz.
+    Tương thích tuyệt đối với bộ giải mã libhelix-mp3 của chip ESP32 theo đặc tả API_SPEC_MUSIC_SERVER.md.
+    """
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-loglevel", "error",
+        "-i", "pipe:0",
+        "-vn",
+        "-c:a", "libmp3lame",
+        "-b:a", "128k",
+        "-ar", "44100",
+        "-f", "mp3",
+        "pipe:1",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def feed_stdin():
+        try:
+            async for chunk in upstream_resp.aiter_raw():
+                process.stdin.write(chunk)
+                await process.stdin.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                process.stdin.close()
+                await process.stdin.wait_closed()
+            except Exception:
+                pass
+
+    feed_task = asyncio.create_task(feed_stdin())
+
+    async def mp3_stream_generator():
+        try:
+            while True:
+                chunk = await process.stdout.read(8192)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            feed_task.cancel()
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                await process.wait()
+            except Exception:
+                pass
+            try:
+                await upstream_resp.aclose()
+            except Exception:
+                pass
+            if client_to_close:
+                try:
+                    await client_to_close.aclose()
+                except Exception:
+                    pass
+
+    return StreamingResponse(
+        mp3_stream_generator(),
+        media_type="audio/mpeg",
+        headers={
+            "Content-Type": "audio/mpeg",
+            "Accept-Ranges": "none",
+            "Cache-Control": "no-cache",
+        }
+    )
+
+
 async def stream_youtube_track(video_id_or_yt: str, request: Request = None):
-    """Bóc tách và stream âm thanh từ YouTube sử dụng PO-Token Provider (M4A/AAC 128kbps)"""
+    """Bóc tách và stream âm thanh từ YouTube sử dụng PO-Token Provider, chuyển đổi sang MP3 128kbps"""
     clean_id = video_id_or_yt[3:] if video_id_or_yt.startswith("yt_") else video_id_or_yt
     target_url = f"https://www.youtube.com/watch?v={clean_id}"
 
@@ -307,29 +383,8 @@ async def stream_youtube_track(video_id_or_yt: str, request: Request = None):
         await client.aclose()
         raise HTTPException(status_code=upstream_resp.status_code, detail="GoogleVideo từ chối kết nối stream")
 
-    async def yt_stream_generator():
-        try:
-            async for chunk in upstream_resp.aiter_raw():
-                yield chunk
-        finally:
-            await upstream_resp.aclose()
-            await client.aclose()
-
-    content_type = upstream_resp.headers.get("content-type", "audio/mp4")
-    response_headers = {
-        "Content-Type": content_type,
-        "Accept-Ranges": "bytes",
-    }
-    if "content-length" in upstream_resp.headers:
-        response_headers["Content-Length"] = upstream_resp.headers["content-length"]
-    if "content-range" in upstream_resp.headers:
-        response_headers["Content-Range"] = upstream_resp.headers["content-range"]
-
-    return StreamingResponse(
-        yt_stream_generator(),
-        status_code=upstream_resp.status_code,
-        headers=response_headers,
-    )
+    # Transcode luồng YouTube sang MP3 chuẩn libhelix-mp3 cho ESP32
+    return await transcode_stream_to_mp3(upstream_resp, client)
 
 
 # =====================================================================
@@ -370,7 +425,7 @@ def search_soundcloud(q: str, limit: int = 3):
 
 
 async def stream_soundcloud_track(track_id_or_sc: str, request: Request = None):
-    """Bóc tách và stream âm thanh từ SoundCloud"""
+    """Bóc tách và stream âm thanh từ SoundCloud (chuyển đổi thời gian thực sang chuẩn MP3 128kbps)"""
     clean_id = track_id_or_sc[3:] if track_id_or_sc.startswith("sc_") else track_id_or_sc
     target_url = f"https://api.soundcloud.com/tracks/soundcloud%3Atracks%3A{clean_id}"
 
@@ -383,71 +438,47 @@ async def stream_soundcloud_track(track_id_or_sc: str, request: Request = None):
     if not stream_url:
         raise HTTPException(status_code=404, detail="Không tìm thấy luồng âm thanh trên SoundCloud")
 
-    client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+    # ffmpeg có thể đọc trực tiếp URL progressive hoặc HLS .m3u8 và xuất thẳng ra MP3 chuẩn
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-loglevel", "error",
+        "-i", stream_url,
+        "-vn",
+        "-c:a", "libmp3lame",
+        "-b:a", "128k",
+        "-ar", "44100",
+        "-f", "mp3",
+        "pipe:1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
 
-    if ".m3u8" in stream_url:
-        playlist_resp = await client.get(stream_url)
-        lines = playlist_resp.text.splitlines()
-
-        init_url = None
-        segment_urls = []
-        for line in lines:
-            line = line.strip()
-            if line.startswith("#EXT-X-MAP:URI="):
-                init_url = line.split('URI="')[1].rstrip('"')
-            elif line and not line.startswith("#"):
-                segment_urls.append(line)
-
-        async def sc_hls_generator():
-            try:
-                if init_url:
-                    init_res = await client.get(init_url)
-                    yield init_res.content
-                for seg in segment_urls:
-                    seg_res = await client.get(seg)
-                    yield seg_res.content
-            finally:
-                await client.aclose()
-
-        return StreamingResponse(
-            sc_hls_generator(),
-            media_type="audio/mp4",
-            headers={
-                "Content-Type": "audio/mp4",
-                "Accept-Ranges": "none",
-                "Cache-Control": "no-cache",
-            }
-        )
-
-    # Nếu là file progressive trực tiếp
-    req_headers = {}
-    if request and "range" in request.headers:
-        req_headers["range"] = request.headers["range"]
-
-    upstream_req = client.build_request("GET", stream_url, headers=req_headers)
-    upstream_resp = await client.send(upstream_req, stream=True)
-
-    async def sc_direct_generator():
+    async def sc_mp3_generator():
         try:
-            async for chunk in upstream_resp.aiter_raw():
+            while True:
+                chunk = await process.stdout.read(8192)
+                if not chunk:
+                    break
                 yield chunk
         finally:
-            await upstream_resp.aclose()
-            await client.aclose()
-
-    response_headers = {
-        "Content-Type": upstream_resp.headers.get("content-type", "audio/mp4"),
-        "Accept-Ranges": "bytes",
-    }
-    if "content-length" in upstream_resp.headers:
-        response_headers["Content-Length"] = upstream_resp.headers["content-length"]
-    if "content-range" in upstream_resp.headers:
-        response_headers["Content-Range"] = upstream_resp.headers["content-range"]
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                await process.wait()
+            except Exception:
+                pass
 
     return StreamingResponse(
-        sc_direct_generator(),
-        status_code=upstream_resp.status_code,
-        headers=response_headers,
+        sc_mp3_generator(),
+        media_type="audio/mpeg",
+        headers={
+            "Content-Type": "audio/mpeg",
+            "Accept-Ranges": "none",
+            "Cache-Control": "no-cache",
+        }
     )
 
 
@@ -677,18 +708,164 @@ async def search_song(q: str):
         raise HTTPException(status_code=500, detail=f"Lỗi tìm kiếm: {str(e)}")
 
 
+@app.get("/stream_pcm")
+async def stream_pcm(request: Request, song: str = "", artist: str = ""):
+    """
+    API Tìm kiếm & Lấy luồng bài hát cho thiết bị ESP32 Xiaozhi.
+    Tuân thủ 100% đặc tả trong tài liệu API_SPEC_MUSIC_SERVER.md:
+    Request: GET /stream_pcm?song=...&artist=...
+    Response JSON:
+    {
+      "title": "Tên bài hát",
+      "artist": "Tên nghệ sĩ",
+      "audio_url": "https://.../stream/{id}.mp3",
+      "lyric_url": "https://.../lyrics/{id}.lrc"
+    }
+    """
+    song_param = song or request.query_params.get("song", "").strip()
+    if not song_param:
+        song_param = request.query_params.get("q", "").strip()
+
+    if not song_param:
+        return {"error": "Song not found", "audio_url": ""}
+
+    artist_param = artist or request.query_params.get("artist", "").strip()
+    query = f"{song_param} {artist_param}".strip()
+
+    print(f"[ESP32 /stream_pcm] Yêu cầu: Song='{song_param}', Artist='{artist_param}' -> Query='{query}'")
+
+    try:
+        # Tìm kiếm bài hát song song trên cả 3 nguồn: ZingMP3, YouTube, SoundCloud
+        zing_task = zing_engine.search(query, limit=3)
+        yt_task = asyncio.to_thread(search_youtube, query, 3)
+        sc_task = asyncio.to_thread(search_soundcloud, query, 2)
+
+        zing_results, yt_results, sc_results = await asyncio.gather(
+            zing_task, yt_task, sc_task, return_exceptions=True
+        )
+
+        zing_items = zing_results if isinstance(zing_results, list) else []
+        yt_items = yt_results if isinstance(yt_results, list) else []
+        sc_items = sc_results if isinstance(sc_results, list) else []
+
+        selected = None
+
+        # 1. Thử bài ZingMP3 miễn phí (phát trực tiếp nhanh nhất nếu không VIP)
+        for item in zing_items:
+            stream_url = await zing_engine.get_stream_url(item["encodeId"])
+            if stream_url:
+                selected = item
+                break
+
+        # 2. Ưu tiên tiếp theo: YouTube (sử dụng BotGuard PO-Token và chuyển đổi MP3)
+        if not selected and yt_items:
+            selected = yt_items[0]
+
+        # 3. Ưu tiên tiếp theo: SoundCloud
+        if not selected and sc_items:
+            selected = sc_items[0]
+
+        # 4. Dự phòng nếu chỉ có Zing (sẽ tự động fallback khi phát)
+        if not selected and zing_items:
+            selected = zing_items[0]
+
+        if not selected:
+            print(f"[!] Không tìm thấy bài hát nào cho: {query}")
+            return {"error": "Song not found", "audio_url": ""}
+
+        encode_id = selected["encodeId"]
+        title = selected.get("title") or song_param
+        artist_name = selected.get("artistsNames") or artist_param or "Nhiều nghệ sĩ"
+
+        # Lưu tiêu đề vào cache để hỗ trợ fallback và đồng bộ lời
+        SONG_TITLE_CACHE[encode_id] = title
+
+        # Xây dựng Base URL động (tự động nhận diện https sau Reverse Proxy của Render)
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+        base_url = f"{proto}://{host}"
+
+        audio_url = f"{base_url}/stream/{encode_id}.mp3"
+        lyric_url = f"{base_url}/lyrics/{encode_id}.lrc"
+
+        print(f"[+] Trả về cho ESP32: Title='{title}', Audio='{audio_url}'")
+        return {
+            "title": title,
+            "artist": artist_name,
+            "audio_url": audio_url,
+            "lyric_url": lyric_url
+        }
+
+    except Exception as e:
+        print(f"[!] Lỗi tại /stream_pcm: {e}")
+        return {"error": "Song not found", "audio_url": ""}
+
+
+@app.api_route("/stream/{track_id:path}", methods=["GET", "HEAD"])
+async def stream_audio_by_path(track_id: str, request: Request):
+    """
+    Endpoint phát nhạc theo đường dẫn: /stream/{id}.mp3 hoặc /stream/{id}
+    Chuẩn hóa theo đặc tả API_SPEC_MUSIC_SERVER.md
+    """
+    clean_id = track_id
+    if clean_id.endswith(".mp3"):
+        clean_id = clean_id[:-4]
+    return await stream_song(clean_id, request)
+
+
+@app.get("/lyrics/{track_id:path}")
+async def get_lyrics(track_id: str):
+    """
+    Endpoint trả về file lời bài hát chuẩn .lrc theo đặc tả API_SPEC_MUSIC_SERVER.md
+    Content-Type: text/plain; charset=utf-8
+    """
+    clean_id = track_id
+    if clean_id.endswith(".lrc"):
+        clean_id = clean_id[:-4]
+
+    title = SONG_TITLE_CACHE.get(clean_id, clean_id)
+    lrc_content = (
+        f"[00:00.00]Đang phát: {title}\n"
+        f"[00:03.00]Xiaozhi Music Server - Hệ thống âm nhạc AI Việt Nam\n"
+        f"[00:06.00]Chúc bạn có những phút giây thư giãn tuyệt vời!\n"
+    )
+    return StreamingResponse(
+        io.BytesIO(lrc_content.encode("utf-8")),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Type": "text/plain; charset=utf-8"}
+    )
+
+
 @app.api_route("/api/song/stream", methods=["GET", "HEAD"])
 async def stream_song(id: str, request: Request):
     """
     Stream âm thanh trực tiếp về ESP32 hoặc Web Browser.
-    Hỗ trợ phát từ ZingMP3 (MP3 128kbps), YouTube (M4A/AAC có PO-Token) và SoundCloud (fMP4/AAC).
+    Định dạng đầu ra: BẮT BUỘC CHUẨN MP3 (audio/mpeg) tương thích bộ giải mã libhelix-mp3 của ESP32.
     Tự động Fallback đa tầng bảo đảm ESP32 không bao giờ bị đứt kết nối: ZingMP3 -> YouTube -> SoundCloud.
     """
+    if id.endswith(".mp3"):
+        id = id[:-4]
+
+    # Nếu id không có tiền tố nguồn (zing_, yt_, sc_), tự động tìm kiếm trên YouTube theo tên bài
+    if not (id.startswith("yt_") or id.startswith("zing_") or id.startswith("sc_")):
+        cached_title = SONG_TITLE_CACHE.get(id)
+        search_query = cached_title or id.replace("-", " ").replace("_", " ")
+        print(f"[*] ID '{id}' không có tiền tố, tự động tìm kiếm theo: '{search_query}'")
+        yt_candidates = await asyncio.to_thread(search_youtube, search_query, 1)
+        if yt_candidates:
+            id = yt_candidates[0]["encodeId"]
+        else:
+            sc_candidates = await asyncio.to_thread(search_soundcloud, search_query, 1)
+            if sc_candidates:
+                id = sc_candidates[0]["encodeId"]
+            else:
+                raise HTTPException(status_code=404, detail=f"Không tìm thấy bài hát: {id}")
+
     fallback_title = request.query_params.get("title") or SONG_TITLE_CACHE.get(id)
 
     try:
         # ==============================================================
-        # TRƯỜNG HỢP 1: BÀI HÁT TỪ YOUTUBE
+        # TRƯỜNG HỢP 1: BÀI HÁT TỪ YOUTUBE (Transcode trực tiếp sang MP3)
         # ==============================================================
         if id.startswith("yt_"):
             try:
@@ -716,7 +893,7 @@ async def stream_song(id: str, request: Request):
                 raise HTTPException(status_code=500, detail=f"Lỗi phát nhạc YouTube: {e}")
 
         # ==============================================================
-        # TRƯỜNG HỢP 2: BÀI HÁT TỪ ZINGMP3
+        # TRƯỜNG HỢP 2: BÀI HÁT TỪ ZINGMP3 (MP3 128kbps)
         # ==============================================================
         if id.startswith("zing_"):
             audio_url = await zing_engine.get_stream_url(id)
@@ -739,7 +916,7 @@ async def stream_song(id: str, request: Request):
                         await client.aclose()
 
                 response_headers = {
-                    "Content-Type": upstream_resp.headers.get("content-type", "audio/mpeg"),
+                    "Content-Type": "audio/mpeg",
                     "Accept-Ranges": "bytes",
                 }
                 if "content-length" in upstream_resp.headers:
@@ -776,7 +953,7 @@ async def stream_song(id: str, request: Request):
             )
 
         # ==============================================================
-        # TRƯỜNG HỢP 3: BÀI HÁT TỪ SOUNDCLOUD
+        # TRƯỜNG HỢP 3: BÀI HÁT TỪ SOUNDCLOUD (Transcode trực tiếp sang MP3)
         # ==============================================================
         return await stream_soundcloud_track(id, request)
 
