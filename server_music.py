@@ -231,6 +231,8 @@ YDL_OPTS_YT_SEARCH = {
     "quiet": True,
     "skip_download": True,
     "extract_flat": True,
+    "socket_timeout": 4,
+    "retries": 0,
 }
 
 
@@ -249,8 +251,9 @@ def get_ydl_opts_yt_stream():
             "node": {"path": node_path}
         },
         "remote_components": ["ejs:github"],
-        "socket_timeout": 6,
-        "retries": 1,
+        "socket_timeout": 4,
+        "retries": 0,
+        "extractor_retries": 0,
     }
 
 
@@ -691,8 +694,8 @@ async def search_song(q: str):
         yt_items = yt_results if isinstance(yt_results, list) else []
         sc_items = sc_results if isinstance(sc_results, list) else []
 
-        # Kết hợp kết quả: Ưu tiên ZingMP3 -> YouTube -> SoundCloud
-        combined = zing_items + yt_items + sc_items
+        # Kết hợp kết quả: Ưu tiên HÀNG ĐẦU SoundCloud -> ZingMP3 -> YouTube
+        combined = sc_items + zing_items + yt_items
 
         # Lưu tiêu đề bài hát vào cache để hỗ trợ tự động Fallback cứu luồng âm thanh
         for item in combined:
@@ -713,14 +716,7 @@ async def stream_pcm(request: Request, song: str = "", artist: str = ""):
     """
     API Tìm kiếm & Lấy luồng bài hát cho thiết bị ESP32 Xiaozhi.
     Tuân thủ 100% đặc tả trong tài liệu API_SPEC_MUSIC_SERVER.md:
-    Request: GET /stream_pcm?song=...&artist=...
-    Response JSON:
-    {
-      "title": "Tên bài hát",
-      "artist": "Tên nghệ sĩ",
-      "audio_url": "https://.../stream/{id}.mp3",
-      "lyric_url": "https://.../lyrics/{id}.lrc"
-    }
+    ƯU TIÊN HÀNG ĐẦU: SoundCloud (không bị chặn 429, không dính bot-guard, cực kỳ ổn định trên Render)
     """
     song_param = song or request.query_params.get("song", "").strip()
     if not song_param:
@@ -735,35 +731,36 @@ async def stream_pcm(request: Request, song: str = "", artist: str = ""):
     print(f"[ESP32 /stream_pcm] Yêu cầu: Song='{song_param}', Artist='{artist_param}' -> Query='{query}'")
 
     try:
-        # Tìm kiếm bài hát song song trên cả 3 nguồn: ZingMP3, YouTube, SoundCloud
+        # Tìm kiếm bài hát song song trên cả 3 nguồn (ưu tiên SoundCloud)
+        sc_task = asyncio.to_thread(search_soundcloud, query, 3)
         zing_task = zing_engine.search(query, limit=3)
-        yt_task = asyncio.to_thread(search_youtube, query, 3)
-        sc_task = asyncio.to_thread(search_soundcloud, query, 2)
+        yt_task = asyncio.to_thread(search_youtube, query, 2)
 
-        zing_results, yt_results, sc_results = await asyncio.gather(
-            zing_task, yt_task, sc_task, return_exceptions=True
+        sc_results, zing_results, yt_results = await asyncio.gather(
+            sc_task, zing_task, yt_task, return_exceptions=True
         )
 
+        sc_items = sc_results if isinstance(sc_results, list) else []
         zing_items = zing_results if isinstance(zing_results, list) else []
         yt_items = yt_results if isinstance(yt_results, list) else []
-        sc_items = sc_results if isinstance(sc_results, list) else []
 
         selected = None
 
-        # 1. Thử bài ZingMP3 miễn phí (phát trực tiếp nhanh nhất nếu không VIP)
-        for item in zing_items:
-            stream_url = await zing_engine.get_stream_url(item["encodeId"])
-            if stream_url:
-                selected = item
-                break
+        # 1. ƯU TIÊN 1 (Theo yêu cầu): SoundCloud (Phát nhạc nhanh nhất, không bị lỗi 429 từ Render)
+        if sc_items:
+            selected = sc_items[0]
 
-        # 2. Ưu tiên tiếp theo: YouTube (sử dụng BotGuard PO-Token và chuyển đổi MP3)
+        # 2. ƯU TIÊN 2: ZingMP3 miễn phí (nếu có bài phát trực tiếp)
+        if not selected:
+            for item in zing_items:
+                stream_url = await zing_engine.get_stream_url(item["encodeId"])
+                if stream_url:
+                    selected = item
+                    break
+
+        # 3. DỰ PHÒNG 3: YouTube (chỉ dùng khi SoundCloud và Zing không tìm thấy)
         if not selected and yt_items:
             selected = yt_items[0]
-
-        # 3. Ưu tiên tiếp theo: SoundCloud
-        if not selected and sc_items:
-            selected = sc_items[0]
 
         # 4. Dự phòng nếu chỉ có Zing (sẽ tự động fallback khi phát)
         if not selected and zing_items:
@@ -788,7 +785,7 @@ async def stream_pcm(request: Request, song: str = "", artist: str = ""):
         audio_url = f"{base_url}/stream/{encode_id}.mp3"
         lyric_url = f"{base_url}/lyrics/{encode_id}.lrc"
 
-        print(f"[+] Trả về cho ESP32: Title='{title}', Audio='{audio_url}'")
+        print(f"[+] Trả về cho ESP32: Title='{title}', Source='{selected.get('source')}', Audio='{audio_url}'")
         return {
             "title": title,
             "artist": artist_name,
@@ -841,23 +838,23 @@ async def stream_song(id: str, request: Request):
     """
     Stream âm thanh trực tiếp về ESP32 hoặc Web Browser.
     Định dạng đầu ra: BẮT BUỘC CHUẨN MP3 (audio/mpeg) tương thích bộ giải mã libhelix-mp3 của ESP32.
-    Tự động Fallback đa tầng bảo đảm ESP32 không bao giờ bị đứt kết nối: ZingMP3 -> YouTube -> SoundCloud.
+    Tự động Fallback đa tầng bảo đảm ESP32 không bao giờ bị đứt kết nối: SoundCloud -> ZingMP3 -> YouTube.
     """
     if id.endswith(".mp3"):
         id = id[:-4]
 
-    # Nếu id không có tiền tố nguồn (zing_, yt_, sc_), tự động tìm kiếm trên YouTube theo tên bài
+    # Nếu id không có tiền tố nguồn (zing_, yt_, sc_), tự động tìm kiếm trên SoundCloud trước
     if not (id.startswith("yt_") or id.startswith("zing_") or id.startswith("sc_")):
         cached_title = SONG_TITLE_CACHE.get(id)
         search_query = cached_title or id.replace("-", " ").replace("_", " ")
-        print(f"[*] ID '{id}' không có tiền tố, tự động tìm kiếm theo: '{search_query}'")
-        yt_candidates = await asyncio.to_thread(search_youtube, search_query, 1)
-        if yt_candidates:
-            id = yt_candidates[0]["encodeId"]
+        print(f"[*] ID '{id}' không có tiền tố, tự động tìm kiếm trên SoundCloud theo: '{search_query}'")
+        sc_candidates = await asyncio.to_thread(search_soundcloud, search_query, 1)
+        if sc_candidates:
+            id = sc_candidates[0]["encodeId"]
         else:
-            sc_candidates = await asyncio.to_thread(search_soundcloud, search_query, 1)
-            if sc_candidates:
-                id = sc_candidates[0]["encodeId"]
+            yt_candidates = await asyncio.to_thread(search_youtube, search_query, 1)
+            if yt_candidates:
+                id = yt_candidates[0]["encodeId"]
             else:
                 raise HTTPException(status_code=404, detail=f"Không tìm thấy bài hát: {id}")
 
@@ -873,19 +870,11 @@ async def stream_song(id: str, request: Request):
             except Exception as e:
                 print(f"[!] Lỗi stream YouTube {id}: {e}")
 
-                # Nếu chưa có fallback_title, bóc tách nhanh tiêu đề từ YouTube metadata
                 if not fallback_title:
-                    clean_vid = id[3:]
-                    try:
-                        def _get_yt_title():
-                            with yt_dlp.YoutubeDL({'quiet': True, 'skip_download': True, 'extract_flat': True}) as ydl:
-                                return ydl.extract_info(f"https://www.youtube.com/watch?v={clean_vid}", download=False).get("title")
-                        fallback_title = await asyncio.to_thread(_get_yt_title)
-                    except Exception:
-                        pass
+                    fallback_title = SONG_TITLE_CACHE.get(id)
 
                 if fallback_title:
-                    print(f"[+] Fallback YouTube sang SoundCloud cho bài: {fallback_title}")
+                    print(f"[+] Fallback ngay lập tức YouTube sang SoundCloud cho bài: {fallback_title}")
                     sc_candidates = await asyncio.to_thread(search_soundcloud, fallback_title, 1)
                     if sc_candidates:
                         return await stream_soundcloud_track(sc_candidates[0]["encodeId"], request)
