@@ -215,11 +215,12 @@ class StreamSession:
     2. Lỗi ngắt quãng sau vài giây: FFmpeg transcode chuẩn CBR 128kbps stereo vào đĩa,
        kèm đầy đủ Accept-Ranges bytes.
     """
-    def __init__(self, track_id: str, title: str = ""):
+    def __init__(self, track_id: str, title: str = "", sample_rate: int = 24000):
         self.track_id = track_id
         self.title = title
-        self.temp_path = os.path.join(CACHE_DIR, f"{track_id}.tmp_{os.getpid()}_{int(time.time() * 1000)}")
-        self.cached_path = os.path.join(CACHE_DIR, f"{track_id}.mp3")
+        self.sample_rate = sample_rate
+        self.temp_path = os.path.join(CACHE_DIR, f"{track_id}_{sample_rate}.tmp_{os.getpid()}_{int(time.time() * 1000)}")
+        self.cached_path = os.path.join(CACHE_DIR, f"{track_id}_{sample_rate}.mp3")
         self.ready_event = asyncio.Event()
         self.is_done = False
         self.error: str | None = None
@@ -317,42 +318,29 @@ class StreamSession:
                 raise Exception(f"Không thể tìm thấy nguồn phát âm thanh cho {self.track_id}")
 
             # THỰC THI STREAMING & CACHING:
-            if is_direct_mp3:
-                # ZingMP3 là MP3 128kbps sẵn: Tải trực tiếp bằng httpx KHÔNG tốn CPU FFmpeg!
-                async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-                    async with client.stream("GET", stream_url) as resp:
-                        if resp.status_code == 200:
-                            with open(self.temp_path, "wb") as f_out:
-                                async for chunk in resp.aiter_raw():
-                                    f_out.write(chunk)
-                                    if not self.ready_event.is_set() and f_out.tell() >= 16384:
-                                        self.ready_event.set()
-                        else:
-                            raise Exception(f"Zing CDN báo lỗi HTTP {resp.status_code}")
-            else:
-                # SoundCloud HLS AAC: Dùng FFmpeg chuyển đổi sang MP3 chuẩn cho ESP32
-                # -threads 2: Giới hạn số luồng không làm nghẽn CPU 0.1 core trên Render Free
-                proc = await asyncio.create_subprocess_exec(
-                    "ffmpeg", "-y", "-loglevel", "error",
-                    "-threads", "2",
-                    "-i", stream_url,
-                    "-vn",
-                    "-c:a", "libmp3lame",
-                    "-b:a", "128k",
-                    "-ar", "44100",
-                    "-ac", "2",
-                    "-f", "mp3",
-                    self.temp_path
-                )
+            # Chuyển đổi toàn bộ âm thanh sang chuẩn MPEG-2 Layer III (24,000 Hz, CBR 128kbps stereo):
+            # Tự động khắc phục hiện tượng rè loa trên firmware ESP32 khóa tần số lấy mẫu 24kHz
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-threads", "2",
+                "-i", stream_url,
+                "-vn",
+                "-c:a", "libmp3lame",
+                "-b:a", "128k",
+                "-ar", str(self.sample_rate),
+                "-ac", "2",
+                "-f", "mp3",
+                self.temp_path
+            )
 
-                # Chờ khi có 16KB dữ liệu đầu tiên (thường < 300ms) là báo ready ngay lập tức!
-                while proc.returncode is None:
-                    if os.path.exists(self.temp_path) and os.path.getsize(self.temp_path) >= 16384:
-                        self.ready_event.set()
-                        break
-                    await asyncio.sleep(0.04)
+            # Chờ khi có 16KB dữ liệu đầu tiên (thường < 300ms) là báo ready ngay lập tức!
+            while proc.returncode is None:
+                if os.path.exists(self.temp_path) and os.path.getsize(self.temp_path) >= 16384:
+                    self.ready_event.set()
+                    break
+                await asyncio.sleep(0.04)
 
-                await proc.wait()
+            await proc.wait()
 
             self.ready_event.set()
 
@@ -413,18 +401,19 @@ class StreamSession:
 ACTIVE_SESSIONS: dict[str, StreamSession] = {}
 
 
-def get_or_create_stream_session(track_id: str, title: str = "") -> StreamSession:
+def get_or_create_stream_session(track_id: str, title: str = "", sample_rate: int = 24000) -> StreamSession:
     clean_id = track_id
     if clean_id.endswith(".mp3"):
         clean_id = clean_id[:-4]
 
-    if clean_id in ACTIVE_SESSIONS:
-        session = ACTIVE_SESSIONS[clean_id]
+    session_key = f"{clean_id}_{sample_rate}"
+    if session_key in ACTIVE_SESSIONS:
+        session = ACTIVE_SESSIONS[session_key]
         if not session.error:
             return session
 
-    session = StreamSession(clean_id, title)
-    ACTIVE_SESSIONS[clean_id] = session
+    session = StreamSession(clean_id, title, sample_rate)
+    ACTIVE_SESSIONS[session_key] = session
     return session
 
 
@@ -618,8 +607,8 @@ async def stream_pcm(request: Request, song: str = "", artist: str = ""):
 
         SONG_TITLE_CACHE[encode_id] = title
 
-        # Khởi động trước session tải/transcode ngay khi nhận request /stream_pcm
-        session = get_or_create_stream_session(encode_id, title)
+        # Khởi động trước session tải/transcode ngay khi nhận request /stream_pcm (chuẩn 24000 Hz)
+        session = get_or_create_stream_session(encode_id, title, sample_rate=24000)
         session.start()
 
         proto = request.headers.get("x-forwarded-proto", request.url.scheme)
@@ -645,14 +634,20 @@ async def stream_pcm(request: Request, song: str = "", artist: str = ""):
 async def stream_audio_by_path(track_id: str, request: Request):
     """
     Endpoint phát nhạc: /stream/{id}.mp3 hoặc /stream/{id}
-    - Nếu bài đã cache: Phục vụ trực tiếp từ đĩa với FileResponse (0ms delay).
-    - Nếu bài mới: Bắt đầu streaming ngay trong < 300ms, không bắt ESP32 chờ 20 giây!
+    - Chuẩn đầu ra: MPEG-2 Layer III, Sample Rate: 24,000 Hz, CBR 128kbps stereo.
+    - Chống rè loa, tương thích hoàn hảo mọi bản firmware ESP32.
     """
     clean_id = track_id
     if clean_id.endswith(".mp3"):
         clean_id = clean_id[:-4]
 
-    cached_file = os.path.join(CACHE_DIR, f"{clean_id}.mp3")
+    sr_param = request.query_params.get("ar") or request.query_params.get("sample_rate") or "24000"
+    try:
+        sample_rate = int(sr_param)
+    except ValueError:
+        sample_rate = 24000
+
+    cached_file = os.path.join(CACHE_DIR, f"{clean_id}_{sample_rate}.mp3")
     if os.path.exists(cached_file) and os.path.getsize(cached_file) > 30000:
         return FileResponse(
             cached_file,
@@ -664,7 +659,7 @@ async def stream_audio_by_path(track_id: str, request: Request):
         )
 
     title = SONG_TITLE_CACHE.get(clean_id, "")
-    session = get_or_create_stream_session(clean_id, title)
+    session = get_or_create_stream_session(clean_id, title, sample_rate)
     session.start()
 
     # Chờ dữ liệu ban đầu sẵn sàng (tối đa 6 giây)
