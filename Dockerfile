@@ -6,37 +6,23 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# 1. Cài đặt các gói hệ thống cần thiết (ffmpeg, curl, git, gnupg) và Node.js 22 từ NodeSource
+# Chỉ cài ffmpeg và ca-certificates (siêu nhẹ, không cần Node.js)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    curl \
-    git \
     ca-certificates \
-    gnupg \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Clone và build BotGuard PO-Token Provider (v2.0.2)
-RUN git clone --single-branch --branch 2.0.2 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /app/bgutil-server && \
-    cd /app/bgutil-server/server && \
-    npm ci && \
-    npx tsc
-
-# 3. Cài đặt các dependencies của Python
+# Cài đặt các gói Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# 4. Copy toàn bộ mã nguồn vào container
+# Copy toàn bộ mã nguồn vào container
 COPY . .
 
-# 5. Phân quyền thực thi cho entrypoint script
 RUN chmod +x /app/entrypoint.sh
 
-# 6. Mở cổng kết nối
 EXPOSE 8000 10000
 
-# 7. Khởi chạy thông qua entrypoint
 ENTRYPOINT ["/app/entrypoint.sh"]
