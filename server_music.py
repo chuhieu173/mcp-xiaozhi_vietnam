@@ -469,6 +469,68 @@ def health_check():
     }
 
 
+@app.get("/system")
+def system_metrics():
+    """Endpoint theo dõi lượng RAM và CPU tiêu thụ theo thời gian thực"""
+    import resource
+    import sys
+
+    # RAM của tiến trình Python hiện tại
+    rusage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        proc_mem_mb = round(rusage / (1024 * 1024), 2)
+    else:
+        proc_mem_mb = round(rusage / 1024, 2)
+
+    # Đọc cgroup memory trên Render Linux container nếu có
+    container_mem_mb = None
+    container_mem_limit_mb = None
+    for p_cur in ["/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"]:
+        if os.path.exists(p_cur):
+            try:
+                with open(p_cur) as f:
+                    container_mem_mb = round(int(f.read().strip()) / (1024 * 1024), 2)
+                break
+            except Exception:
+                pass
+
+    for p_max in ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
+        if os.path.exists(p_max):
+            try:
+                with open(p_max) as f:
+                    val = f.read().strip()
+                    if val != "max":
+                        container_mem_limit_mb = round(int(val) / (1024 * 1024), 2)
+                break
+            except Exception:
+                pass
+
+    used_mb = container_mem_mb or proc_mem_mb
+    limit_mb = container_mem_limit_mb or 512.0
+    mem_percent = round((used_mb / limit_mb) * 100, 1)
+
+    # Đếm số file cache và dung lượng thư mục cache
+    cache_files = [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR) if f.endswith(".mp3")]
+    total_cache_bytes = sum(os.path.getsize(f) for f in cache_files if os.path.exists(f))
+    total_cache_mb = round(total_cache_bytes / (1024 * 1024), 2)
+
+    return {
+        "status": "ok",
+        "memory": {
+            "used_mb": used_mb,
+            "limit_mb": limit_mb,
+            "usage_percent": f"{mem_percent}%",
+            "python_process_rss_mb": proc_mem_mb,
+        },
+        "cache": {
+            "cached_songs_count": len(cache_files),
+            "total_cache_size_mb": total_cache_mb,
+            "cache_dir": CACHE_DIR,
+        },
+        "active_sessions_count": len(ACTIVE_SESSIONS),
+    }
+
+
 @app.get("/api/search")
 async def search_song(q: str):
     """
