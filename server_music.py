@@ -174,16 +174,50 @@ YDL_OPTS_SC_SEARCH = {
     "retries": 1,
 }
 
+class SilentLogger:
+    def debug(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        pass
+
+
 YDL_OPTS_SC_STREAM = {
     "format": "bestaudio/best",
     "quiet": True,
+    "no_warnings": True,
     "skip_download": True,
     "socket_timeout": 8,
     "retries": 1,
+    "logger": SilentLogger(),
 }
 
 
-def search_soundcloud(q: str, limit: int = 4):
+def extract_soundcloud_stream(track_id: str) -> str | None:
+    """
+    Trích xuất direct stream URL từ SoundCloud track_id.
+    Tự động bắt lỗi nếu track dính bản quyền DRM (SoundCloud Go+) hoặc không thể phát.
+    Trả về URL trực tiếp hoặc None nếu không phát được.
+    """
+    clean_id = track_id[3:] if track_id.startswith("sc_") else track_id
+    url = f"https://api.soundcloud.com/tracks/soundcloud%3Atracks%3A{clean_id}"
+    try:
+        with yt_dlp.YoutubeDL(YDL_OPTS_SC_STREAM) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info.get("url")
+    except Exception as e:
+        err_msg = str(e)
+        if "DRM" in err_msg:
+            print(f"[!] Bỏ qua SoundCloud {track_id}: dính bản quyền DRM (SoundCloud Go+)")
+        else:
+            print(f"[!] Bỏ qua SoundCloud {track_id}: {err_msg[:60]}")
+        return None
+
+
+def search_soundcloud(q: str, limit: int = 5):
     try:
         with yt_dlp.YoutubeDL(YDL_OPTS_SC_SEARCH) as ydl:
             res = ydl.extract_info(f"scsearch{limit}:{q}", download=False)
@@ -221,6 +255,7 @@ class StreamSession:
         self.sample_rate = sample_rate
         self.temp_path = os.path.join(CACHE_DIR, f"{track_id}_{sample_rate}.tmp_{os.getpid()}_{int(time.time() * 1000)}")
         self.cached_path = os.path.join(CACHE_DIR, f"{track_id}_{sample_rate}.mp3")
+        self.cached_stream_url: str | None = None
         self.ready_event = asyncio.Event()
         self.is_done = False
         self.error: str | None = None
@@ -245,39 +280,43 @@ class StreamSession:
             except Exception:
                 pass
 
-            stream_url = None
+            stream_url = self.cached_stream_url
             is_direct_mp3 = False
 
             # NGUỒN 1: SoundCloud
-            if self.track_id.startswith("sc_"):
-                clean_id = self.track_id[3:]
-                target_url = f"https://api.soundcloud.com/tracks/soundcloud%3Atracks%3A{clean_id}"
+            if not stream_url and self.track_id.startswith("sc_"):
+                stream_url = await asyncio.to_thread(extract_soundcloud_stream, self.track_id)
 
-                def _ext_sc():
-                    with yt_dlp.YoutubeDL(YDL_OPTS_SC_STREAM) as ydl:
-                        return ydl.extract_info(target_url, download=False)
+                # Nếu bài này dính DRM hoặc lỗi link, tự động tìm các bản SoundCloud khác cùng tên không dính DRM!
+                if not stream_url:
+                    search_title = self.title or SONG_TITLE_CACHE.get(self.track_id)
+                    if search_title:
+                        print(f"[*] Đang tìm kiếm bản SoundCloud thay thế không dính DRM cho: '{search_title}'")
+                        sc_candidates = await asyncio.to_thread(search_soundcloud, search_title, 5)
+                        for cand in sc_candidates:
+                            alt_id = cand["encodeId"]
+                            if alt_id == self.track_id:
+                                continue
+                            alt_stream = await asyncio.to_thread(extract_soundcloud_stream, alt_id)
+                            if alt_stream:
+                                print(f"[✓] Đã tìm thấy bản SoundCloud thay thế hợp lệ: {cand.get('title')} ({alt_id})")
+                                stream_url = alt_stream
+                                break
 
-                try:
-                    info = await asyncio.to_thread(_ext_sc)
-                    stream_url = info.get("url")
-                except Exception as e:
-                    print(f"[!] Lỗi trích xuất SoundCloud {self.track_id}: {e}")
-
-                # Nếu lỗi link SoundCloud, tự động fallback sang ZingMP3
+                # Nếu vẫn không được, fallback sang ZingMP3
                 if not stream_url:
                     fb_title = self.title or SONG_TITLE_CACHE.get(self.track_id)
                     if fb_title:
-                        zing_cands = await zing_engine.search(fb_title, 2)
+                        zing_cands = await zing_engine.search(fb_title, 3)
                         for z in zing_cands:
                             z_url = await zing_engine.get_stream_url(z["encodeId"])
                             if z_url:
-                                self.track_id = z["encodeId"]
                                 stream_url = z_url
                                 is_direct_mp3 = True
                                 break
 
             # NGUỒN 2: ZingMP3
-            elif self.track_id.startswith("zing_"):
+            elif not stream_url and self.track_id.startswith("zing_"):
                 stream_url = await zing_engine.get_stream_url(self.track_id)
                 if stream_url:
                     is_direct_mp3 = True
@@ -285,34 +324,22 @@ class StreamSession:
                     # Nếu bài Zing bị VIP, fallback sang SoundCloud
                     fb_title = self.title or SONG_TITLE_CACHE.get(self.track_id) or await zing_engine.get_song_title(self.track_id)
                     if fb_title:
-                        sc_cands = await asyncio.to_thread(search_soundcloud, fb_title, 1)
-                        if sc_cands:
-                            self.track_id = sc_cands[0]["encodeId"]
-                            clean_id = self.track_id[3:]
-                            target_url = f"https://api.soundcloud.com/tracks/soundcloud%3Atracks%3A{clean_id}"
-
-                            def _ext_sc_fb():
-                                with yt_dlp.YoutubeDL(YDL_OPTS_SC_STREAM) as ydl:
-                                    return ydl.extract_info(target_url, download=False)
-
-                            info = await asyncio.to_thread(_ext_sc_fb)
-                            stream_url = info.get("url")
+                        sc_cands = await asyncio.to_thread(search_soundcloud, fb_title, 5)
+                        for cand in sc_cands:
+                            alt_stream = await asyncio.to_thread(extract_soundcloud_stream, cand["encodeId"])
+                            if alt_stream:
+                                stream_url = alt_stream
+                                break
 
             # NGUỒN 3: Tên bài hát tự do không có tiền tố
-            else:
+            elif not stream_url:
                 search_q = self.title or self.track_id.replace("-", " ").replace("_", " ")
-                sc_cands = await asyncio.to_thread(search_soundcloud, search_q, 1)
-                if sc_cands:
-                    self.track_id = sc_cands[0]["encodeId"]
-                    clean_id = self.track_id[3:]
-                    target_url = f"https://api.soundcloud.com/tracks/soundcloud%3Atracks%3A{clean_id}"
-
-                    def _ext_sc_free():
-                        with yt_dlp.YoutubeDL(YDL_OPTS_SC_STREAM) as ydl:
-                            return ydl.extract_info(target_url, download=False)
-
-                    info = await asyncio.to_thread(_ext_sc_free)
-                    stream_url = info.get("url")
+                sc_cands = await asyncio.to_thread(search_soundcloud, search_q, 5)
+                for cand in sc_cands:
+                    alt_stream = await asyncio.to_thread(extract_soundcloud_stream, cand["encodeId"])
+                    if alt_stream:
+                        stream_url = alt_stream
+                        break
 
             if not stream_url:
                 raise Exception(f"Không thể tìm thấy nguồn phát âm thanh cho {self.track_id}")
@@ -571,7 +598,7 @@ async def stream_pcm(request: Request, song: str = "", artist: str = ""):
     print(f"[ESP32 /stream_pcm] Yêu cầu: Song='{song_param}', Artist='{artist_param}' -> Query='{query}'")
 
     try:
-        sc_task = asyncio.to_thread(search_soundcloud, query, 3)
+        sc_task = asyncio.to_thread(search_soundcloud, query, 5)
         zing_task = zing_engine.search(query, limit=3)
 
         sc_results, zing_results = await asyncio.gather(sc_task, zing_task, return_exceptions=True)
@@ -580,25 +607,28 @@ async def stream_pcm(request: Request, song: str = "", artist: str = ""):
         zing_items = zing_results if isinstance(zing_results, list) else []
 
         selected = None
+        found_stream_url = None
 
-        # 1. Ưu tiên số 1: SoundCloud (Kho nhạc khổng lồ, không chặn bot)
+        # 1. Ưu tiên số 1: SoundCloud (Kiểm tra và tự động bỏ qua các bản DRM Go+)
         if sc_items:
-            selected = sc_items[0]
+            for item in sc_items:
+                stream_link = await asyncio.to_thread(extract_soundcloud_stream, item["encodeId"])
+                if stream_link:
+                    selected = item
+                    found_stream_url = stream_link
+                    break
 
-        # 2. Ưu tiên số 2: ZingMP3 MIỄN PHÍ
+        # 2. Ưu tiên số 2: ZingMP3 MIỄN PHÍ nếu SoundCloud toàn bộ dính DRM
         if not selected and zing_items:
             for item in zing_items:
                 stream_url = await zing_engine.get_stream_url(item["encodeId"])
                 if stream_url:
                     selected = item
+                    found_stream_url = stream_url
                     break
 
-        # 3. Dự phòng nếu chỉ có Zing (tự động fallback khi tải)
-        if not selected and zing_items:
-            selected = zing_items[0]
-
         if not selected:
-            print(f"[!] Không tìm thấy bài hát nào cho: {query}")
+            print(f"[!] Không tìm thấy bài hát nào có thể phát cho: {query}")
             return {"error": "Song not found", "audio_url": ""}
 
         encode_id = selected["encodeId"]
@@ -609,6 +639,8 @@ async def stream_pcm(request: Request, song: str = "", artist: str = ""):
 
         # Khởi động trước session tải/transcode ngay khi nhận request /stream_pcm (chuẩn 24000 Hz)
         session = get_or_create_stream_session(encode_id, title, sample_rate=24000)
+        if found_stream_url:
+            session.cached_stream_url = found_stream_url
         session.start()
 
         proto = request.headers.get("x-forwarded-proto", request.url.scheme)
